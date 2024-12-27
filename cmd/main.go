@@ -2,150 +2,212 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/rs/cors"
+	"github.com/zhekagigs/turing-room/llm"
+	"github.com/zhekagigs/turing-room/logger"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type Role string
+
+const (
+	Interviewer Role = "interviewer"
+	Polee       Role = "polee"
+	AI          Role = "ai"
 )
 
 type Client struct {
 	conn *websocket.Conn
-	role string // "interviewer" or "interviewee"
 	send chan []byte
-}
-
-type Room struct {
-	interviewers [2]*Client
-	interviewee  *Client
-	broadcast    chan []byte
+	role Role
+	room *Room
 }
 
 type Message struct {
-	Sender    string `json:"sender"`
-	Content   string `json:"content"`
-	Timestamp int64  `json:"timestamp"`
+	Content string `json:"content"`
+	From    Role   `json:"from"`
+	To      Role   `json:"to"`
 }
 
-var (
-	rooms = make(map[string]*Room)
-	mutex sync.Mutex
-)
+type Room struct {
+	ID          string
+	Interviewer *Client
+	Polee       *Client
+	AI          llm.AIClient
+	broadcast   chan Message
+	messages    *MessageStorage
+}
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for this example
-	},
+type MessageStorage struct {
+}
+
+var rooms = make(map[string]*Room)
+var roomsMutex = sync.Mutex{}
+
+func init() {
+	go func() {
+		for {
+			roomsMutex.Lock()
+			for _, room := range rooms {
+				select {
+				case message := <-room.broadcast:
+					go broadcastMessage(room, message)
+				default:
+				}
+			}
+			roomsMutex.Unlock()
+			time.Sleep(time.Millisecond * 100)
+		}
+	}()
 }
 
 func main() {
+	logger.Initialize("logs/app.log")
+	logger.Info("Starting application...")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", handleWebSocket)
 	mux.HandleFunc("/api/config", handleConfig)
 
-	// Use CORS middleware
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"http://localhost:5500"}, // Live Server default port
+		AllowedOrigins: []string{"http://localhost:5500", "http://localhost:8000"},
 		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
 	})
 	handler := c.Handler(mux)
 
-	log.Println("Server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", handler))
-}
-
-
-func handleConfig(w http.ResponseWriter, r *http.Request) {
-    config := map[string]string{
-        "message": "Config loaded successfully",
-    }
-    json.NewEncoder(w).Encode(config)
+	logger.Info("Server starting on :8080")
+	logger.Fatal(http.ListenAndServe(":8080", handler))
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		logger.Error("Failed to upgrade connection:", err)
 		return
 	}
 
-	client := &Client{
-		conn: conn,
-		role: r.URL.Query().Get("role"),
-		send: make(chan []byte, 256),
-	}
-
 	roomID := r.URL.Query().Get("room")
-	mutex.Lock()
-	room, ok := rooms[roomID]
-	if !ok {
-		room = &Room{
-			broadcast: make(chan []byte, 256),
-		}
-		rooms[roomID] = room
-	}
-	mutex.Unlock()
+	role := Role(r.URL.Query().Get("role"))
 
-	switch client.role {
-	case "interviewer":
-		if room.interviewers[0] == nil {
-			room.interviewers[0] = client
-		} else if room.interviewers[1] == nil {
-			room.interviewers[1] = client
-		} else {
-			log.Println("Room is full for interviewers")
-			conn.Close()
-			return
-		}
-	case "interviewee":
-		if room.interviewee == nil {
-			room.interviewee = client
-		} else {
-			log.Println("Room already has an interviewee")
-			conn.Close()
-			return
-		}
-	default:
-		log.Println("Invalid role")
+	if role != Interviewer && role != Polee {
+		logger.Error("Invalid role:", role)
 		conn.Close()
 		return
 	}
 
-	go readPump(client, room)
+	client := &Client{conn: conn, send: make(chan []byte, 256), role: role}
+
+	roomsMutex.Lock()
+	room, ok := rooms[roomID]
+	if !ok {
+		room = &Room{
+			ID:        roomID,
+			broadcast: make(chan Message),
+			AI:        llm.NewOllamaClient("http://localhost:11434/v1"),
+		}
+		rooms[roomID] = room
+		go handleRoomMessages(room)
+	}
+
+	switch role {
+	case Interviewer:
+		if room.Interviewer != nil {
+			roomsMutex.Unlock()
+			logger.Error("Room already has an interviewer")
+			conn.Close()
+			return
+		}
+		room.Interviewer = client
+	case Polee:
+		if room.Polee != nil {
+			roomsMutex.Unlock()
+			logger.Error("Room already has a polee")
+			conn.Close()
+			return
+		}
+		room.Polee = client
+	}
+	roomsMutex.Unlock()
+
+	client.room = room
+
+	go readPump(client)
 	go writePump(client)
+
+	logger.Info("New WebSocket connection established for role:", role)
 }
 
-func readPump(client *Client, room *Room) {
+func handleRoomMessages(room *Room) {
+	for {
+		msg := <-room.broadcast
+		switch msg.To {
+		case Interviewer:
+			sendToClient(room.Interviewer, msg)
+		case Polee:
+			sendToClient(room.Polee, msg)
+		case AI:
+			aiResponse, err := room.AI.GenerateResponse(msg.Content, "Pretend you are human")
+			if err != nil {
+				logger.Error("Error generating AI response:", err)
+				continue
+			}
+			aiMsg := Message{Content: aiResponse, From: AI, To: Interviewer}
+			sendToClient(room.Interviewer, aiMsg)
+		}
+	}
+}
+
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	logger.Info("Handling config request")
+	config := map[string]string{
+		"message": "Config loaded successfully",
+	}
+	json.NewEncoder(w).Encode(config)
+}
+
+func readPump(client *Client) {
 	defer func() {
-		room.broadcast <- []byte(client.role + " disconnected")
 		client.conn.Close()
+		if client.room != nil {
+			if client.role == Interviewer {
+				client.room.Interviewer = nil
+			} else if client.role == Polee {
+				client.room.Polee = nil
+			}
+		}
 	}()
 
 	for {
 		_, message, err := client.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				logger.Error("Error reading message:", err)
 			}
 			break
 		}
-		msg := Message{
-			Sender:    client.role,
-			Content:   string(message),
-			Timestamp: time.Now().Unix(),
+		var msg Message
+		if err := json.Unmarshal(message, &msg); err != nil {
+			logger.Error("Error unmarshaling message:", err)
+			continue
 		}
-		jsonMsg, _ := json.Marshal(msg)
-		room.broadcast <- jsonMsg
+		msg.From = client.role
+		client.room.broadcast <- msg
 	}
 }
 
 func writePump(client *Client) {
 	defer client.conn.Close()
-
 	for {
 		select {
 		case message, ok := <-client.send:
@@ -153,50 +215,65 @@ func writePump(client *Client) {
 				client.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			w, err := client.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-
-			if err := w.Close(); err != nil {
+			if err := client.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				logger.Error("Error writing message:", err)
 				return
 			}
 		}
 	}
 }
 
-func broadcastMessage(room *Room, message []byte) {
-	for _, interviewer := range room.interviewers {
-		if interviewer != nil {
-			select {
-			case interviewer.send <- message:
-			default:
-				close(interviewer.send)
-			}
-		}
+func sendToClient(client *Client, msg Message) {
+	if client == nil {
+		return
 	}
-	if room.interviewee != nil {
+	messageJSON, err := json.Marshal(msg)
+	if err != nil {
+		logger.Error("Error marshaling message:", err)
+		return
+	}
+	client.send <- messageJSON
+}
+
+func broadcastMessage(room *Room, message Message) {
+	messageJSON, err := json.Marshal(message)
+	if err != nil {
+		logger.Error("Error marshaling message:", err)
+		return
+	}
+
+	sendToClient := func(client *Client) {
+		if client == nil {
+			return
+		}
 		select {
-		case room.interviewee.send <- message:
+		case client.send <- messageJSON:
 		default:
-			close(room.interviewee.send)
+			close(client.send)
+			if client.role == Interviewer {
+				room.Interviewer = nil
+			} else if client.role == Polee {
+				room.Polee = nil
+			}
 		}
 	}
-}
 
-func init() {
-	go func() {
-		for {
-			for _, room := range rooms {
-				select {
-				case message := <-room.broadcast:
-					broadcastMessage(room, message)
-				default:
-				}
-			}
-			time.Sleep(time.Millisecond * 100)
+	switch message.To {
+	case Interviewer:
+		sendToClient(room.Interviewer)
+	case Polee:
+		sendToClient(room.Polee)
+	case AI:
+		aiResponse, err := room.AI.GenerateResponse(message.Content, "Pretend you are human")
+		if err != nil {
+			logger.Error("Error generating AI response:", err)
+			return
 		}
-	}()
+		aiMsg := Message{Content: aiResponse, From: AI, To: Interviewer}
+		fmt.Println("aiMsg", aiMsg)
+		sendToClient(room.Interviewer)
+	default:
+		sendToClient(room.Interviewer)
+		sendToClient(room.Polee)
+	}
 }

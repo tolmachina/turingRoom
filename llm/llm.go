@@ -10,6 +10,10 @@ type OllamaClient struct {
 	BaseURL string
 }
 
+type AIClient interface {
+	GenerateResponse(model, prompt string) (string, error)
+}
+
 type OllamaRequest struct {
 	Model  string `json:"model"`
 	Prompt string `json:"prompt"`
